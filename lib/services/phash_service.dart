@@ -1,165 +1,251 @@
 import 'dart:io';
 import 'dart:ui' as ui;
-import 'package:image/image.dart' as img;
+import 'dart:math';
 import 'package:flutter/foundation.dart';
+import 'package:image/image.dart' as img;
+import 'package:exif/exif.dart';
 import '../models/image_metadata.dart';
 import '../models/duplicate_set.dart';
 
+class CancellationToken {
+  bool _isCancelled = false;
+  bool get isCancelled => _isCancelled;
+  void cancel() => _isCancelled = true;
+}
+
+class Edge {
+  final int i, j;
+  final double score;
+  Edge(this.i, this.j, this.score);
+}
+
+class ClusteringParams {
+  final List<ImageMetadata> metaList;
+  final double limit;
+  ClusteringParams(this.metaList, this.limit);
+}
+
 class PHashService {
-  /// 두 해시 간의 Hamming Distance를 계산
-  static int calculateHammingDistance(BigInt h1, BigInt h2) {
-    BigInt x = h1 ^ h2;
-    int distance = 0;
-    while (x > BigInt.zero) {
-      if (x & BigInt.one == BigInt.one) distance++;
-      x >>= 1;
+  static BigInt _computeDCTpHash(List<double> grayscale32x32) {
+    final List<List<double>> matrix = List.generate(32, (i) => grayscale32x32.sublist(i * 32, (i + 1) * 32));
+    final List<List<double>> dctMatrix = _applyDCT2D(matrix);
+    final List<double> lowFreq = [];
+    for (int y = 0; y < 12; y++) {
+      for (int x = 0; x < 12; x++) {
+        if (x == 0 && y == 0) continue;
+        lowFreq.add(dctMatrix[y][x]);
+      }
     }
-    return distance;
+    final double median = (lowFreq.toList()..sort())[lowFreq.length ~/ 2];
+    BigInt hash = BigInt.zero;
+    for (int i = 0; i < lowFreq.length; i++) {
+      if (lowFreq[i] > median) hash |= (BigInt.one << i);
+    }
+    return hash;
   }
 
-  /// [사용자 제안 최적화] 이미지를 아주 작은 크기로 네이티브 디코딩 후 pHash 생성
-  /// 이 방식은 고해상도 이미지를 전부 메모리에 올리지 않아 OOM을 완벽히 방지합니다.
-  static Future<BigInt> generatePHashNative(String path) async {
+  static List<List<double>> _applyDCT2D(List<List<double>> input) {
+    int N = 32;
+    List<List<double>> temp = List.generate(N, (_) => List.filled(N, 0.0));
+    List<List<double>> output = List.generate(N, (_) => List.filled(N, 0.0));
+    for (int i = 0; i < N; i++) {
+      for (int j = 0; j < N; j++) {
+        double sum = 0;
+        for (int k = 0; k < N; k++) sum += input[i][k] * cos(pi / N * (k + 0.5) * j);
+        temp[i][j] = sum;
+      }
+    }
+    for (int j = 0; j < N; j++) {
+      for (int i = 0; i < N; i++) {
+        double sum = 0;
+        for (int k = 0; k < N; k++) sum += temp[k][j] * cos(pi / N * (k + 0.5) * i);
+        output[i][j] = sum;
+      }
+    }
+    return output;
+  }
+
+  static Future<ImageMetadata?> extractFeatures(String path, CancellationToken token) async {
+    if (token.isCancelled) return null;
     try {
       final File file = File(path);
       final Uint8List bytes = await file.readAsBytes();
-
-      // 1. 네이티브 엔진을 사용해 이미지를 처음부터 16x16 크기로만 디코딩 (메모리 절약 핵심)
+      
       final ui.ImmutableBuffer buffer = await ui.ImmutableBuffer.fromUint8List(bytes);
       final ui.ImageDescriptor descriptor = await ui.ImageDescriptor.encoded(buffer);
       
-      // 16x16 정도로 타겟 사이즈를 잡아 성능과 정확도의 균형을 맞춤
-      final ui.Codec codec = await descriptor.instantiateCodec(
-        targetWidth: 16, 
-        targetHeight: 16
-      );
-      final ui.FrameInfo frameInfo = await codec.getNextFrame();
-      final ui.Image uiImage = frameInfo.image;
-
-      // 2. 픽셀 데이터 추출 (RGBA_8888)
-      final ByteData? byteData = await uiImage.toByteData(format: ui.ImageByteFormat.rawRgba);
-      if (byteData == null) return BigInt.zero;
-      final Uint8List pixels = byteData.buffer.asUint8List();
-
-      // 3. 16x16 데이터를 8x8 평균 해시로 변환
-      int totalLuminance = 0;
-      final List<int> luminanceList = [];
-
-      // 16x16 -> 8x8 샘플링 및 그레이스케일 변환
-      for (int y = 0; y < 16; y += 2) {
-        for (int x = 0; x < 16; x += 2) {
-          int offset = (y * 16 + x) * 4;
-          // 간단한 그레이스케일 변환: (R + G + B) / 3
-          int luminance = (pixels[offset] + pixels[offset + 1] + pixels[offset + 2]) ~/ 3;
-          luminanceList.add(luminance);
-          totalLuminance += luminance;
+      // 1. Sharpness (128x128)
+      final ui.Codec sharpCodec = await descriptor.instantiateCodec(targetWidth: 128, targetHeight: 128);
+      final ui.FrameInfo sharpFrame = await sharpCodec.getNextFrame();
+      final ByteData? sharpData = await sharpFrame.image.toByteData(format: ui.ImageByteFormat.rawRgba);
+      double sharpness = 0;
+      if (sharpData != null) {
+        final Uint8List sPixels = sharpData.buffer.asUint8List();
+        final List<double> sGray = [];
+        for (int i = 0; i < 16384; i++) sGray.add(0.299 * sPixels[i*4] + 0.587 * sPixels[i*4+1] + 0.114 * sPixels[i*4+2]);
+        for (int y = 1; y < 127; y++) {
+          for (int x = 1; x < 127; x++) {
+            double c = sGray[y * 128 + x];
+            double d = (c * 4) - sGray[(y-1)*128+x] - sGray[(y+1)*128+x] - sGray[y*128+x-1] - sGray[y*128+x+1];
+            sharpness += d * d;
+          }
         }
+        sharpness /= 16384;
       }
+      sharpFrame.image.dispose();
+      if (token.isCancelled) { descriptor.dispose(); buffer.dispose(); return null; }
 
-      final int avgLuminance = totalLuminance ~/ 64;
-      BigInt hash = BigInt.zero;
-      for (int i = 0; i < 64; i++) {
-        if (luminanceList[i] >= avgLuminance) {
-          hash |= (BigInt.one << i);
+      // 2. pHash/Hist (32x32)
+      final ui.Codec analCodec = await descriptor.instantiateCodec(targetWidth: 32, targetHeight: 32);
+      final ui.FrameInfo analFrame = await analCodec.getNextFrame();
+      final ByteData? analData = await analFrame.image.toByteData(format: ui.ImageByteFormat.rawRgba);
+      if (analData == null) return null;
+      final Uint8List pixels = analData.buffer.asUint8List();
+      final List<double> grayscale = [];
+      final List<double> rHist = List.filled(8, 0.0), gHist = List.filled(8, 0.0), bHist = List.filled(8, 0.0);
+      for (int i = 0; i < 1024; i++) {
+        int r = pixels[i*4], g = pixels[i*4+1], b = pixels[i*4+2];
+        grayscale.add(0.299 * r + 0.587 * g + 0.114 * b);
+        rHist[r ~/ 32]++; gHist[g ~/ 32]++; bHist[b ~/ 32]++;
+      }
+      final List<double> histogram = [...rHist, ...gHist, ...bHist].map((v) => v / 1024).toList();
+      final BigInt pHash = _computeDCTpHash(grayscale);
+      analFrame.image.dispose();
+
+      // 3. EXIF 추출 (exif 패키지 사용)
+      DateTime? dateTime;
+      try {
+        final Map<String, IfdTag> data = await readExifFromBytes(bytes);
+        if (data.containsKey('Image DateTime')) {
+          final String dateStr = data['Image DateTime']!.toString();
+          // 포맷: 2023:10:25 14:30:05
+          final parts = dateStr.split(' ');
+          final dateParts = parts[0].split(':');
+          final timeParts = parts[1].split(':');
+          dateTime = DateTime(
+            int.parse(dateParts[0]),
+            int.parse(dateParts[1]),
+            int.parse(dateParts[2]),
+            int.parse(timeParts[0]),
+            int.parse(timeParts[1]),
+            int.parse(timeParts[2]),
+          );
         }
-      }
-
-      // 리소스 해제
-      uiImage.dispose();
+      } catch (_) {}
+      dateTime ??= file.lastModifiedSync();
+      
+      final int w = descriptor.width;
+      final int h = descriptor.height;
       descriptor.dispose();
       buffer.dispose();
 
-      return hash;
-    } catch (e) {
-      debugPrint("Native Hash 생성 실패 ($path): $e");
-      return BigInt.zero;
-    }
+      return ImageMetadata(
+        path: path, fileName: path.split(Platform.pathSeparator).last,
+        hash: pHash, size: file.lengthSync(), dateTime: dateTime!,
+        width: w, height: h, sharpness: sharpness, histogram: histogram,
+      );
+    } catch (e) { return null; }
   }
 
-  /// 모든 이미지에 대해 병렬 해시 계산 및 그룹화
+  static double _getScore(ImageMetadata m1, ImageMetadata m2) {
+    if ((m1.aspectRatio - m2.aspectRatio).abs() > 0.15) return 1.0;
+    int hamming = 0;
+    BigInt x = m1.hash ^ m2.hash;
+    while (x > BigInt.zero) { x &= (x - BigInt.one); hamming++; }
+    double pHashScore = hamming / 143.0;
+    double histDist = 0;
+    for (int i = 0; i < m1.histogram.length; i++) histDist += pow(m1.histogram[i] - m2.histogram[i], 2);
+    double histScore = sqrt(histDist) / sqrt(2);
+    double nameScore = 1.0;
+    String n1 = m1.fileName.toLowerCase(), n2 = m2.fileName.toLowerCase();
+    if (n1 == n2) {
+      nameScore = 0.0;
+    } else {
+      String b1 = n1.replaceAll(RegExp(r'\(\d+\)|_copy| - 복사본'), '').split('.').first;
+      String b2 = n2.replaceAll(RegExp(r'\(\d+\)|_copy| - 복사본'), '').split('.').first;
+      if (b1 == b2) nameScore = 0.2;
+    }
+    // 최종 점수 합산 (pHash 75% + Histogram 20% + Name 5%)
+    return (pHashScore * 0.75) + (histScore * 0.20) + (nameScore * 0.05);
+  }
+
+  /// 더 유연한 클러스터링을 위해 Single-Linkage(Connected Components) 방식으로 수행
+  static List<DuplicateSet> _performClustering(ClusteringParams params) {
+    final metaList = params.metaList;
+    final limit = params.limit;
+    final int n = metaList.length;
+    final List<Edge> edges = [];
+
+    for (int i = 0; i < n; i++) {
+      for (int j = i + 1; j < n; j++) {
+        double score = _getScore(metaList[i], metaList[j]);
+        bool isRecent = metaList[j].dateTime.difference(metaList[i].dateTime).inMinutes <= 5;
+        if (isRecent || score < 0.15) {
+          if (score <= limit) edges.add(Edge(i, j, score));
+        } else {
+          if (metaList[j].dateTime.difference(metaList[i].dateTime).inHours > 1) break;
+        }
+      }
+    }
+    
+    edges.sort((a, b) => a.score.compareTo(b.score));
+    final List<int> clusterMap = List.generate(n, (i) => i);
+    final List<List<int>?> clusters = List.generate(n, (i) => [i]);
+
+    for (var edge in edges) {
+      int c1Idx = clusterMap[edge.i], c2Idx = clusterMap[edge.j];
+      if (c1Idx == c2Idx) continue;
+
+      // Single-Linkage: 한 쌍이라도 비슷하면 즉시 그룹 통합
+      final c1 = clusters[c1Idx]!, c2 = clusters[c2Idx]!;
+      c1.addAll(c2);
+      for (int b in c2) clusterMap[b] = c1Idx;
+      clusters[c2Idx] = null;
+    }
+
+    return clusters.where((c) => c != null && c.length > 1)
+        .map((c) => DuplicateSet(images: c!.map((idx) => metaList[idx]).toList()))
+        .toList();
+  }
+
   static Future<List<DuplicateSet>> analyzeFolder({
     required String folderPath,
     required int threshold,
-    required Function(int current, int total) onProgress,
+    required CancellationToken token,
+    required Function(int current, int total, String? currentPath, int duplicateCount) onProgress,
   }) async {
     final dir = Directory(folderPath);
-    final List<File> files = dir.listSync()
-        .whereType<File>()
-        .where((f) {
-          final path = f.path.toLowerCase();
-          return path.endsWith('.jpg') || path.endsWith('.jpeg') || path.endsWith('.png');
-        })
-        .toList();
-
-    if (files.isEmpty) return [];
-
-    onProgress(0, files.length);
-
-    final List<ImageMetadata?> metadataListTemp = List.filled(files.length, null);
+    final List<String> filePaths = [];
+    await for (var entity in dir.list(recursive: false, followLinks: false)) {
+      if (token.isCancelled) return [];
+      if (entity is File && entity.path.toLowerCase().contains(RegExp(r'\.(jpg|jpeg|png|heic)$'))) {
+        filePaths.add(entity.path);
+      }
+    }
     
-    // 네이티브 디코딩을 사용하므로 동시 처리 개수를 다시 늘려도 안전합니다.
+    if (filePaths.isEmpty) return [];
+
+    final List<ImageMetadata> metaList = [];
+    final int total = filePaths.length;
     final int concurrency = Platform.numberOfProcessors;
-    int completedCount = 0;
-
-    // 동시 실행을 제어하면서 처리
-    for (int i = 0; i < files.length; i += concurrency) {
-      final int end = (i + concurrency < files.length) ? i + concurrency : files.length;
-      final List<Future<void>> batch = [];
-
-      for (int j = i; j < end; j++) {
-        final int index = j;
-        final String filePath = files[index].path;
-        
-        batch.add(() async {
-          // compute 대신 직접 비동기 호출 (네이티브 코덱은 비동기로 충분히 효율적)
-          final hash = await generatePHashNative(filePath);
-          if (hash != BigInt.zero) {
-            metadataListTemp[index] = ImageMetadata(
-              path: filePath,
-              fileName: filePath.split(Platform.pathSeparator).last,
-              hash: hash,
-              size: File(filePath).lengthSync(),
-            );
-          }
-          completedCount++;
-          onProgress(completedCount, files.length);
-        }());
-      }
-      await Future.wait(batch);
+    for (int i = 0; i < total; i += concurrency) {
+      if (token.isCancelled) return [];
+      final int end = (i + concurrency < total) ? i + concurrency : total;
+      final List<Future<ImageMetadata?>> batch = [];
+      for (int j = i; j < end; j++) batch.add(extractFeatures(filePaths[j], token));
+      final results = await Future.wait(batch);
+      metaList.addAll(results.whereType<ImageMetadata>());
+      onProgress(metaList.length, total, filePaths[i], 0);
     }
 
-    final List<ImageMetadata> metadataList = metadataListTemp.whereType<ImageMetadata>().toList();
+    if (token.isCancelled) return [];
+    metaList.sort((a, b) => a.dateTime.compareTo(b.dateTime));
 
-    // 2. Hamming Distance 기반 그룹화 (이미지 수가 많을 경우 최적화)
-    final List<DuplicateSet> sets = [];
-    final Set<int> processedIndices = {};
+    final double limit = 0.10 + (threshold / 100) * 0.4;
 
-    for (int i = 0; i < metadataList.length; i++) {
-      if (processedIndices.contains(i)) continue;
-
-      final List<ImageMetadata> currentSet = [metadataList[i]];
-      
-      // 내부 루프에서도 처리된 인덱스는 건너뜀
-      for (int j = i + 1; j < metadataList.length; j++) {
-        if (processedIndices.contains(j)) continue;
-
-        // Hamming Distance 계산
-        int distance = calculateHammingDistance(
-          metadataList[i].hash, 
-          metadataList[j].hash
-        );
-
-        if (distance <= threshold) {
-          currentSet.add(metadataList[j]);
-          processedIndices.add(j);
-        }
-      }
-
-      if (currentSet.length > 1) {
-        processedIndices.add(i);
-        sets.add(DuplicateSet(images: currentSet));
-      }
-    }
-    return sets;
+    // 클러스터링 연산을 Isolate에서 실행 (메인 스레드 멈춤 방지)
+    final results = await compute(_performClustering, ClusteringParams(metaList, limit));
+    onProgress(total, total, null, results.length);
+    return results;
   }
 }

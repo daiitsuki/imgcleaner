@@ -10,7 +10,6 @@ class AnalysisScreen extends ConsumerWidget {
     final state = ref.watch(analysisProvider);
     final selectedPath = ModalRoute.of(context)!.settings.arguments as String;
 
-    // 분석 완료 시 결과 화면으로 이동
     if (!state.isAnalyzing && state.results.isNotEmpty) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         Navigator.pushReplacementNamed(context, '/comparison', arguments: selectedPath);
@@ -18,12 +17,13 @@ class AnalysisScreen extends ConsumerWidget {
     }
 
     final bool isDone = !state.isAnalyzing;
-    final bool noResults = isDone && state.results.isEmpty && state.error == null;
+    final bool noResults = isDone && state.results.isEmpty && state.error == null && !state.isCancelled;
+    final bool isCancelled = state.isCancelled;
 
     return Scaffold(
       appBar: AppBar(
         title: const Text("분석 중"),
-        automaticallyImplyLeading: isDone, // 분석 완료 시에만 뒤로가기 버튼 활성화
+        automaticallyImplyLeading: isDone || isCancelled,
       ),
       body: Center(
         child: Padding(
@@ -32,43 +32,63 @@ class AnalysisScreen extends ConsumerWidget {
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               if (noResults) ...[
-                const Icon(Icons.search_off, size: 64, color: Colors.grey),
+                const Icon(Icons.image_not_supported_outlined, size: 64, color: Colors.grey),
                 const SizedBox(height: 16),
-                const Text("중복된 사진을 찾지 못했습니다.", 
-                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                const Text("분석할 사진이 없습니다.", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                const SizedBox(height: 8),
+                const Text("선택하신 폴더에 이미지 파일이 있는지 확인해 주세요.", textAlign: TextAlign.center, style: TextStyle(color: Colors.grey)),
                 const SizedBox(height: 24),
-                ElevatedButton(
-                  onPressed: () => Navigator.pop(context),
-                  child: const Text("뒤로 가기"),
-                ),
+                ElevatedButton(onPressed: () => Navigator.pop(context), child: const Text("다른 폴더 선택하기")),
+              ] else if (isCancelled) ...[
+                const Icon(Icons.cancel_outlined, size: 64, color: Colors.orange),
+                const SizedBox(height: 16),
+                const Text("분석이 취소되었습니다.", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                const SizedBox(height: 24),
+                ElevatedButton(onPressed: () => Navigator.pop(context), child: const Text("뒤로 가기")),
               ] else ...[
-                Text(state.isAnalyzing ? "이미지를 분석하고 있습니다..." : "분석 완료", 
-                  style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                // 실시간 미리보기 제거됨
+                const Icon(Icons.search, size: 80, color: Colors.blue),
                 const SizedBox(height: 32),
+                _buildDynamicStatus(state),
+                const SizedBox(height: 16),
                 LinearProgressIndicator(
                   value: state.progress,
                   minHeight: 12,
                   borderRadius: BorderRadius.circular(6),
                 ),
-                const SizedBox(height: 16),
-                Text("${(state.progress * 100).toInt()}% 완료", 
-                  style: const TextStyle(fontWeight: FontWeight.bold)),
+                const SizedBox(height: 12),
+                Text("${(state.progress * 100).toInt()}% 분석 완료", style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.grey)),
+                const SizedBox(height: 40),
+                if (state.isAnalyzing)
+                  OutlinedButton.icon(
+                    onPressed: () => ref.read(analysisProvider.notifier).cancelAnalysis(),
+                    icon: const Icon(Icons.stop),
+                    label: const Text("분석 중단"),
+                    style: OutlinedButton.styleFrom(foregroundColor: Colors.red),
+                  ),
               ],
-              const SizedBox(height: 24),
               if (state.error != null) ...[
-                Text("오류: ${state.error}", 
-                  style: const TextStyle(color: Colors.red),
-                  textAlign: TextAlign.center),
+                const SizedBox(height: 24),
+                Text("오류: ${state.error}", style: const TextStyle(color: Colors.red), textAlign: TextAlign.center),
                 const SizedBox(height: 16),
-                ElevatedButton(
-                  onPressed: () => Navigator.pop(context),
-                  child: const Text("뒤로 가기"),
-                ),
+                ElevatedButton(onPressed: () => Navigator.pop(context), child: const Text("뒤로 가기")),
               ],
             ],
           ),
         ),
       ),
+    );
+  }
+
+  Widget _buildDynamicStatus(AnalysisState state) {
+    String text = "이미지를 분석하고 있습니다...";
+    if (state.progress > 0.9) text = "거의 다 됐어요! 중복 세트 구성 중...";
+    else if (state.duplicateCount > 0) text = "${state.duplicateCount}개의 중복 세트 발견!";
+    
+    return Text(
+      text,
+      textAlign: TextAlign.center,
+      style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
     );
   }
 }

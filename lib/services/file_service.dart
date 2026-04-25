@@ -1,98 +1,119 @@
 import 'dart:io';
+import 'dart:ui' as ui;
 import 'package:image/image.dart' as img;
 import 'package:path/path.dart' as p;
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 
 class FileService {
-  /// 중복 이미지 처리 로직
-  /// mode: 'MOVE' (이동), 'RESIZE' (50% 리사이징 후 이동), 'DELETE' (삭제)
+  static const _channel = MethodChannel('com.example.duplicated_img/media_scanner');
+
+  /// 여러 파일을 한 번에 미디어 스캔 (실패 시 개별 스캔으로 전환)
+  static Future<void> _scanMultipleFiles(List<String> paths) async {
+    if (!Platform.isAndroid || paths.isEmpty) return;
+    
+    try {
+      await _channel.invokeMethod('scanMultipleFiles', {'paths': paths});
+    } on MissingPluginException {
+      debugPrint("scanMultipleFiles를 찾을 수 없음. 개별 스캔으로 전환합니다.");
+      for (var path in paths) {
+        try {
+          await _channel.invokeMethod('scanFile', {'path': path});
+        } catch (_) {}
+      }
+    } catch (e) {
+      debugPrint("미디어 일괄 스캔 오류: $e");
+    }
+  }
+
+  static String _getUniquePath(String dirPath, String fileName) {
+    String name = p.basenameWithoutExtension(fileName);
+    String ext = p.extension(fileName);
+    int counter = 1;
+    String newPath = p.join(dirPath, fileName);
+    while (File(newPath).existsSync()) {
+      newPath = p.join(dirPath, "${name}_$counter$ext");
+      counter++;
+    }
+    return newPath;
+  }
+
   static Future<void> processFiles({
     required List<String> targetPaths,
     required String originalFolderPath,
     required String mode,
+    Function(int current, int total)? onProgress,
   }) async {
-    // 대상 폴더 경로 (_duplicate 접미사 추가)
     final String duplicateDirPath = "${originalFolderPath}_duplicate";
+    final List<String> filesToScan = [];
     
-    // 이동이나 리사이징 시 대상 폴더 생성
     if (mode == 'MOVE' || mode == 'RESIZE') {
       final dir = Directory(duplicateDirPath);
-      if (!await dir.exists()) {
-        try {
-          await dir.create(recursive: true);
-        } catch (e) {
-          debugPrint("대상 폴더 생성 실패: $e");
-          rethrow;
-        }
-      }
+      if (!await dir.exists()) await dir.create(recursive: true);
     }
 
-    for (var path in targetPaths) {
+    final int total = targetPaths.length;
+    for (int i = 0; i < total; i++) {
+      final path = targetPaths[i];
       final sourceFile = File(path);
       if (!await sourceFile.exists()) continue;
 
       final fileName = p.basename(path);
-      final destPath = p.join(duplicateDirPath, fileName);
-      final destFile = File(destPath);
+      final destPath = (mode == 'MOVE' || mode == 'RESIZE') ? _getUniquePath(duplicateDirPath, fileName) : "";
       
       try {
         switch (mode) {
           case 'MOVE':
-            // Android 11+ 대응: rename 대신 copy & delete 사용
-            // 1. 파일 복사
             await sourceFile.copy(destPath);
-            
-            // 2. 복사 성공 확인 (파일 존재 및 크기 체크)
-            if (await destFile.exists() && (await destFile.length() == await sourceFile.length())) {
-              // 3. 원본 삭제
-              await sourceFile.delete();
-            } else {
-              throw FileSystemException("파일 복사 검증 실패", path);
-            }
+            await sourceFile.delete();
+            filesToScan.add(path);
+            filesToScan.add(destPath);
             break;
             
           case 'RESIZE':
             final bytes = await sourceFile.readAsBytes();
-            final image = img.decodeImage(bytes);
-            if (image != null) {
-              final resized = img.copyResize(image, 
-                width: (image.width * 0.5).toInt(), 
-                height: (image.height * 0.5).toInt()
+            final buffer = await ui.ImmutableBuffer.fromUint8List(bytes);
+            final descriptor = await ui.ImageDescriptor.encoded(buffer);
+            final targetW = (descriptor.width * 0.5).toInt();
+            final targetH = (descriptor.height * 0.5).toInt();
+            
+            final codec = await descriptor.instantiateCodec(targetWidth: targetW, targetHeight: targetH);
+            final frame = await codec.getNextFrame();
+            final uiImage = frame.image;
+            
+            final byteData = await uiImage.toByteData(format: ui.ImageByteFormat.rawRgba);
+            if (byteData != null) {
+              final image = img.Image.fromBytes(
+                width: targetW, 
+                height: targetH, 
+                bytes: byteData.buffer,
+                numChannels: 4
               );
-              
-              // 리사이징된 파일 저장
-              await destFile.writeAsBytes(img.encodeJpg(resized));
-              
-              // 저장 성공 확인 후 원본 삭제
-              if (await destFile.exists()) {
-                await sourceFile.delete();
-              }
+              await File(destPath).writeAsBytes(img.encodeJpg(image));
+              await sourceFile.delete();
+              filesToScan.add(path);
+              filesToScan.add(destPath);
             }
+            // 리소스 즉시 해제
+            uiImage.dispose();
+            descriptor.dispose();
+            buffer.dispose();
             break;
             
           case 'DELETE':
             await sourceFile.delete();
+            filesToScan.add(path);
             break;
         }
       } catch (e) {
-        debugPrint("파일 처리 중 오류 발생 ($path): $e");
-        
-        // 롤백 로직: MOVE 모드에서 복사는 됐는데 삭제 중 오류가 났거나 하는 경우
-        if (mode == 'MOVE' || mode == 'RESIZE') {
-          if (await destFile.exists() && await sourceFile.exists()) {
-            try {
-              await destFile.delete(); // 복사본 삭제 (원본이 남아있으므로)
-              debugPrint("롤백 완료: 생성된 복사본 삭제됨 ($destPath)");
-            } catch (rollbackError) {
-              debugPrint("롤백 실패: $rollbackError");
-            }
-          }
-        }
-        
-        if (e is FileSystemException) {
-          debugPrint("OS Error Code: ${e.osError?.errorCode}, Message: ${e.osError?.message}");
-        }
+        debugPrint("파일 처리 오류 ($path): $e");
       }
+      onProgress?.call(i + 1, total);
     }
+
+    // 모든 처리가 끝난 후 단 한 번만 미디어 스캔 호출 (시스템 부하 감소)
+    await _scanMultipleFiles(filesToScan);
+    // 시스템이 미디어 스캔을 처리할 시간을 잠시 줌
+    await Future.delayed(const Duration(milliseconds: 500));
   }
 }
