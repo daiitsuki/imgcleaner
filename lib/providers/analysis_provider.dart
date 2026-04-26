@@ -67,7 +67,7 @@ class AnalysisNotifier extends StateNotifier<AnalysisState> {
     }
   }
 
-  Future<void> startAnalysis(String folderPath, int threshold) async {
+  Future<void> startAnalysis(String folderPath, int threshold, {DateTime? startDate, DateTime? endDate}) async {
     _currentToken = CancellationToken();
     state = state.copyWith(
       isAnalyzing: true, progress: 0.0, results: [], error: null, isCancelled: false,
@@ -77,10 +77,13 @@ class AnalysisNotifier extends StateNotifier<AnalysisState> {
     try {
       final results = await PHashService.analyzeFolder(
         folderPath: folderPath, threshold: threshold, token: _currentToken!,
-        onProgress: (current, total, currentPath, count) {
+        startDate: startDate,
+        endDate: endDate,
+        onProgress: (current, total, currentPath, currentResults) {
           state = state.copyWith(
             progress: current / total, currentImagePath: currentPath,
-            duplicateCount: count > 0 ? count : state.duplicateCount,
+            results: currentResults,
+            duplicateCount: currentResults.length,
           );
         },
       );
@@ -96,6 +99,35 @@ class AnalysisNotifier extends StateNotifier<AnalysisState> {
       }
     } catch (e) {
       state = state.copyWith(isAnalyzing: false, error: e.toString());
+    }
+  }
+
+  void showCurrentResults() {
+    // 분석을 중단하고 현재까지 발견된 결과로 전환
+    cancelAnalysis();
+    // SharedPreferences에 현재까지의 결과 저장
+    saveResults();
+  }
+
+  void toggleSetExpansion(int index) {
+    if (index < 0 || index >= state.results.length) return;
+    
+    final newResults = List<DuplicateSet>.from(state.results);
+    final targetSet = newResults[index];
+    newResults[index] = DuplicateSet(
+      images: targetSet.images,
+      isExpanded: !targetSet.isExpanded,
+    );
+    
+    state = state.copyWith(results: newResults);
+  }
+
+  Future<void> saveResults() async {
+    if (state.results.isEmpty) return;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('last_analysis_results', jsonEncode(state.results.map((e) => e.toJson()).toList()));
+    if (state.folderPath != null) {
+      await prefs.setString('last_analysis_path', state.folderPath!);
     }
   }
 

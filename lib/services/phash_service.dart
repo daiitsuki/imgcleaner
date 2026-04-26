@@ -212,13 +212,22 @@ class PHashService {
     required String folderPath,
     required int threshold,
     required CancellationToken token,
-    required Function(int current, int total, String? currentPath, int duplicateCount) onProgress,
+    required Function(int current, int total, String? currentPath, List<DuplicateSet> results) onProgress,
+    DateTime? startDate,
+    DateTime? endDate,
   }) async {
     final dir = Directory(folderPath);
     final List<String> filePaths = [];
+    
+    // 파일 목록 수집 시 기간 필터링 적용
     await for (var entity in dir.list(recursive: false, followLinks: false)) {
       if (token.isCancelled) return [];
       if (entity is File && entity.path.toLowerCase().contains(RegExp(r'\.(jpg|jpeg|png|heic)$'))) {
+        if (startDate != null || endDate != null) {
+          final lastModified = await entity.lastModified();
+          if (startDate != null && lastModified.isBefore(startDate)) continue;
+          if (endDate != null && lastModified.isAfter(endDate)) continue;
+        }
         filePaths.add(entity.path);
       }
     }
@@ -228,6 +237,9 @@ class PHashService {
     final List<ImageMetadata> metaList = [];
     final int total = filePaths.length;
     final int concurrency = Platform.numberOfProcessors;
+    final double limit = 0.10 + (threshold / 100) * 0.4;
+    List<DuplicateSet> latestResults = [];
+
     for (int i = 0; i < total; i += concurrency) {
       if (token.isCancelled) return [];
       final int end = (i + concurrency < total) ? i + concurrency : total;
@@ -235,17 +247,22 @@ class PHashService {
       for (int j = i; j < end; j++) batch.add(extractFeatures(filePaths[j], token));
       final results = await Future.wait(batch);
       metaList.addAll(results.whereType<ImageMetadata>());
-      onProgress(metaList.length, total, filePaths[i], 0);
+      
+      // 약 20장마다 또는 마지막에 중간 클러스터링 수행하여 최신 결과 갱신
+      if (metaList.length % (concurrency * 5) == 0 || i + concurrency >= total) {
+        final List<ImageMetadata> sortedList = List.from(metaList)..sort((a, b) => a.dateTime.compareTo(b.dateTime));
+        latestResults = await compute(_performClustering, ClusteringParams(sortedList, limit));
+      }
+      
+      // 항상 '가장 최신' 결과를 전달하여 깜빡임 방지
+      onProgress(metaList.length, total, filePaths[i], latestResults);
     }
 
     if (token.isCancelled) return [];
     metaList.sort((a, b) => a.dateTime.compareTo(b.dateTime));
 
-    final double limit = 0.10 + (threshold / 100) * 0.4;
-
-    // 클러스터링 연산을 Isolate에서 실행 (메인 스레드 멈춤 방지)
-    final results = await compute(_performClustering, ClusteringParams(metaList, limit));
-    onProgress(total, total, null, results.length);
-    return results;
+    final finalResults = await compute(_performClustering, ClusteringParams(metaList, limit));
+    onProgress(total, total, null, finalResults);
+    return finalResults;
   }
 }

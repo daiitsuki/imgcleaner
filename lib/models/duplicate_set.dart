@@ -3,8 +3,9 @@ import 'image_metadata.dart';
 class DuplicateSet {
   final List<ImageMetadata> images;
   late final int recommendedIndex;
+  bool isExpanded;
   
-  DuplicateSet({required this.images}) {
+  DuplicateSet({required this.images, this.isExpanded = true}) {
     recommendedIndex = _calculateRecommendedIndex();
   }
 
@@ -34,9 +35,11 @@ class DuplicateSet {
 
   Map<String, dynamic> toJson() => {
     'images': images.map((e) => e.toJson()).toList(),
+    'isExpanded': isExpanded,
   };
 
   factory DuplicateSet.fromJson(Map<String, dynamic> json) => DuplicateSet(
     images: (json['images'] as List).map((e) => ImageMetadata.fromJson(e)).toList(),
+    isExpanded: json['isExpanded'] ?? true,
   );
 }
